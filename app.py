@@ -1,13 +1,20 @@
-import spaces
+# =============================================================================
+#  SynthID Watermark Removal — Render Deployment
+#  Dhmn's Adaptive Watermark Weakening Pipeline
+#  CPU-only, no GPU required
+# =============================================================================
+
 import os
 import cv2
 import numpy as np
 import pywt
+import json
 import gradio as gr
 from PIL import Image
 from scipy.ndimage import generic_filter
 from skimage.metrics import structural_similarity, peak_signal_noise_ratio
 from trustmark import TrustMark
+from datetime import datetime
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -23,9 +30,77 @@ MIN_SIGMA          = 1.0
 MAX_SIGMA          = 6.0
 WAVELET            = "haar"
 FREQUENCY_STRENGTH = 4.0
+ANALYTICS_FILE     = "analytics.json"
 np.random.seed(42)
 
-TM = None  # lazy-loaded inside @spaces.GPU
+# =============================================================================
+# ANALYTICS
+# =============================================================================
+def load_analytics():
+    if os.path.exists(ANALYTICS_FILE):
+        with open(ANALYTICS_FILE) as f:
+            return json.load(f)
+    return {
+        "total_images"   : 0,
+        "removed"        : 0,
+        "not_removed"    : 0,
+        "both_criteria"  : 0,
+        "avg_ssim"       : 0.0,
+        "avg_psnr"       : 0.0,
+        "ssim_sum"       : 0.0,
+        "psnr_sum"       : 0.0,
+        "history"        : []
+    }
+
+def save_analytics(data):
+    with open(ANALYTICS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def update_analytics(removed, ssim, psnr, attack_name):
+    data = load_analytics()
+    data["total_images"] += 1
+    if removed:
+        data["removed"] += 1
+        if ssim >= 0.85:
+            data["both_criteria"] += 1
+    else:
+        data["not_removed"] += 1
+    data["ssim_sum"] += ssim
+    data["psnr_sum"] += psnr
+    data["avg_ssim"] = round(data["ssim_sum"] / data["total_images"], 4)
+    data["avg_psnr"] = round(data["psnr_sum"] / data["total_images"], 2)
+    data["history"].append({
+        "timestamp"  : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "removed"    : removed,
+        "ssim"       : round(ssim, 4),
+        "psnr"       : round(psnr, 2),
+        "best_attack": attack_name,
+    })
+    # Keep only last 100 entries
+    data["history"] = data["history"][-100:]
+    save_analytics(data)
+    return data
+
+def get_analytics_md():
+    data = load_analytics()
+    total = data["total_images"]
+    if total == 0:
+        return "No images processed yet."
+    removal_pct = round(data["removed"] / total * 100, 1)
+    both_pct    = round(data["both_criteria"] / total * 100, 1)
+    return f"""## 📊 Live Analytics
+
+| Metric | Value |
+|---|---|
+| **Total images processed** | `{total}` |
+| **Watermark removed** | `{data['removed']} ({removal_pct}%)` |
+| **Not removed** | `{data['not_removed']}` |
+| **Both criteria met** (removed + SSIM ≥ 0.85) | `{data['both_criteria']} ({both_pct}%)` |
+| **Average SSIM** | `{data['avg_ssim']}` |
+| **Average PSNR** | `{data['avg_psnr']} dB` |
+
+*Updated on every image processed. Resets on server restart.*
+"""
 
 # =============================================================================
 # UTILS
@@ -41,14 +116,18 @@ def normalize_map(data):
     return cv2.normalize(data, None, 0, 1, cv2.NORM_MINMAX)
 
 # =============================================================================
-# WATERMARK
+# TRUSTMARK
 # =============================================================================
-def embed_watermark(tm, image):
-    watermarked = tm.encode(opencv_to_pil(image), PAYLOAD, MODE="text", WM_STRENGTH=WM_STRENGTH)
-    return pil_to_opencv(watermarked)
+print("Loading TrustMark-Q...")
+TM = TrustMark(verbose=False, model_type="Q", use_ECC=True)
+print("Ready.")
 
-def decode_watermark(tm, image):
-    payload, detected, version = tm.decode(opencv_to_pil(image), MODE="text")
+def embed_watermark(image):
+    wm = TM.encode(opencv_to_pil(image), PAYLOAD, MODE="text", WM_STRENGTH=WM_STRENGTH)
+    return pil_to_opencv(wm)
+
+def decode_watermark(image):
+    payload, detected, version = TM.decode(opencv_to_pil(image), MODE="text")
     return {"payload": payload, "detected": bool(detected), "version": version}
 
 # =============================================================================
@@ -100,7 +179,8 @@ def apply_adaptive_salt_pepper(image, importance_map):
 # =============================================================================
 def attack_level(coeffs, importance):
     LH, HL, HH = coeffs
-    imp    = cv2.resize(importance, (LH.shape[1], LH.shape[0]), interpolation=cv2.INTER_LINEAR)
+    imp    = cv2.resize(importance, (LH.shape[1], LH.shape[0]),
+                        interpolation=cv2.INTER_LINEAR)
     atten  = 1 - (0.35 * imp)
     LH     = LH * atten + np.random.normal(0, FREQUENCY_STRENGTH, LH.shape) * imp
     HL     = HL * atten + np.random.normal(0, FREQUENCY_STRENGTH, HL.shape) * imp
@@ -112,10 +192,10 @@ def attack_level(coeffs, importance):
     return (LH, HL, HH)
 
 def apply_frequency_perturbation(image, importance_map):
-    ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
-    Y     = ycrcb[:, :, 0].astype(np.float32)
+    ycrcb  = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
+    Y      = ycrcb[:, :, 0].astype(np.float32)
     coeffs = pywt.wavedec2(Y, wavelet=WAVELET, level=2)
-    rec = pywt.waverec2(
+    rec    = pywt.waverec2(
         [coeffs[0],
          attack_level(list(coeffs[1]), importance_map),
          attack_level(list(coeffs[2]), importance_map)],
@@ -129,10 +209,8 @@ def apply_frequency_perturbation(image, importance_map):
 # COMPRESSION
 # =============================================================================
 def apply_jpeg_compression(image, quality):
-    success, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-    if not success:
-        raise RuntimeError("JPEG encoding failed.")
-    return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    _, enc = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    return cv2.imdecode(enc, cv2.IMREAD_COLOR)
 
 # =============================================================================
 # GEOMETRY
@@ -140,11 +218,13 @@ def apply_jpeg_compression(image, quality):
 def crop_resize_attack(image, crop_ratio=0.05):
     h, w   = image.shape[:2]
     dx, dy = int(w * crop_ratio), int(h * crop_ratio)
-    return cv2.resize(image[dy:h-dy, dx:w-dx], (w, h), interpolation=cv2.INTER_CUBIC)
+    return cv2.resize(image[dy:h-dy, dx:w-dx], (w, h),
+                      interpolation=cv2.INTER_CUBIC)
 
 def scale_cycle_attack(image, scale=0.75):
     h, w  = image.shape[:2]
-    small = cv2.resize(image, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+    small = cv2.resize(image, (int(w*scale), int(h*scale)),
+                       interpolation=cv2.INTER_AREA)
     return cv2.resize(small, (w, h), interpolation=cv2.INTER_CUBIC)
 
 def rotation_attack(image, angle=2):
@@ -153,7 +233,7 @@ def rotation_attack(image, angle=2):
     return cv2.warpAffine(image, M, (w, h), borderMode=cv2.BORDER_REFLECT)
 
 # =============================================================================
-# ATTACK PIPELINE (from main.py — generate_pipeline)
+# ATTACK PIPELINE
 # =============================================================================
 jpeg_qualities  = [95, 90, 85, 70, 60, 50, 40, 30]
 crop_levels     = [0.02, 0.04, 0.06, 0.08]
@@ -167,17 +247,17 @@ def generate_pipeline(name, noisy_image, importance_map, attacks):
     attacks[f"{name} + DWT"] = dwt
 
     for q in jpeg_qualities:
-        attacks[f"{name} + DWT + JPEG{q}"] = apply_jpeg_compression(dwt, quality=q)
+        attacks[f"{name} + DWT + JPEG{q}"] = apply_jpeg_compression(dwt, q)
 
     for q1, q2 in double_jpeg:
         attacks[f"{name} + DWT + JPEG{q1}->{q2}"] = apply_jpeg_compression(
-            apply_jpeg_compression(dwt, quality=q1), quality=q2)
+            apply_jpeg_compression(dwt, q1), q2)
 
     for crop_ratio in crop_levels:
         crop  = crop_resize_attack(dwt, crop_ratio=crop_ratio)
         label = int(crop_ratio * 100)
-        attacks[f"{name} + Crop{label}%"]          = crop
-        attacks[f"{name} + Crop{label}% + JPEG30"] = apply_jpeg_compression(crop, 30)
+        attacks[f"{name} + Crop{label}%"]              = crop
+        attacks[f"{name} + Crop{label}% + JPEG30"]     = apply_jpeg_compression(crop, 30)
         attacks[f"{name} + Crop{label}% + JPEG30->80"] = apply_jpeg_compression(
             apply_jpeg_compression(crop, 30), 80)
 
@@ -197,58 +277,48 @@ def generate_pipeline(name, noisy_image, importance_map, attacks):
             apply_jpeg_compression(rot, 30), 80)
 
 # =============================================================================
-# EVALUATION (from evaluation.py — get_best_attack logic from main.py)
+# EVALUATION
 # =============================================================================
-def evaluate_attack(tm, reference_image, attacked_image):
-    result = decode_watermark(tm, attacked_image)
+def evaluate_attack(reference_image, attacked_image):
+    result = decode_watermark(attacked_image)
     psnr   = peak_signal_noise_ratio(reference_image, attacked_image, data_range=255)
     ssim   = structural_similarity(
         cv2.cvtColor(reference_image, cv2.COLOR_BGR2GRAY),
         cv2.cvtColor(attacked_image,  cv2.COLOR_BGR2GRAY),
         data_range=255
     )
+    payload_match = round(
+        sum(a == b for a, b in zip(PAYLOAD, str(result["payload"])))
+        / len(PAYLOAD) * 100, 2
+    )
     return {
         "Detected":          result["detected"],
         "Payload":           result["payload"],
-        "Payload Match (%)": round(sum(a==b for a,b in zip(PAYLOAD, str(result["payload"])))
-                                   / len(PAYLOAD) * 100, 2),
-        "PSNR":  round(psnr, 2),
-        "SSIM":  round(ssim, 4),
+        "Payload Match (%)": payload_match,
+        "PSNR":              round(psnr, 2),
+        "SSIM":              round(ssim, 4),
     }
 
 # =============================================================================
-# MAIN RUN FUNCTION
+# MAIN RUN
 # =============================================================================
-@spaces.GPU(duration=120)
 def run(image):
-    global TM
-    if TM is None:
-        print("Loading TrustMark-Q...")
-        TM = TrustMark(verbose=False, model_type="Q", use_ECC=True)
-        print("Ready.")
-
     if image is None:
-        return None, None, "⚠️ Please upload an image."
+        return None, None, "⚠️ Please upload an image.", get_analytics_md()
 
-    # Convert PIL → OpenCV BGR (keep original resolution)
     if isinstance(image, np.ndarray):
         image = Image.fromarray(image)
     original = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
 
-    # Embed watermark
-    print("Embedding watermark...")
-    watermarked = embed_watermark(TM, original)
-
-    # Verify embedding
-    verify = decode_watermark(TM, watermarked)
+    # Embed
+    watermarked = embed_watermark(original)
+    verify      = decode_watermark(watermarked)
     print(f"Embedded — Detected: {verify['detected']}  Payload: {verify['payload']}")
 
-    # Analyse image
-    print("Analysing image...")
+    # Analyse
     maps = analyze_image(watermarked)
 
-    # Generate all attacks
-    print("Generating attacks...")
+    # Generate attacks
     attacks = {}
     generate_pipeline("Gaussian",
         apply_adaptive_gaussian(watermarked, maps["importance"]),
@@ -260,52 +330,47 @@ def run(image):
         apply_adaptive_salt_pepper(watermarked, maps["importance"]),
         maps["importance"], attacks)
 
-    print(f"Total attacks generated: {len(attacks)}")
+    print(f"Total attacks: {len(attacks)}")
 
-    # Evaluate all attacks
-    print("Evaluating...")
+    # Evaluate
     reports = {}
     for attack_name, att_image in attacks.items():
         try:
-            reports[attack_name] = evaluate_attack(TM, watermarked, att_image)
+            reports[attack_name] = evaluate_attack(watermarked, att_image)
         except:
             pass
 
-    # Select best (from main.py logic)
-    removed = [(n, r) for n, r in reports.items() if r["Detected"] == False]
-    if removed:
-        removed.sort(key=lambda x: (x[1]["SSIM"], x[1]["PSNR"]), reverse=True)
-        best_name   = removed[0][0]
-        best_report = removed[0][1]
+    # Pick best
+    removed_attacks = [(n, r) for n, r in reports.items() if not r["Detected"]]
+    if removed_attacks:
+        removed_attacks.sort(key=lambda x: (x[1]["SSIM"], x[1]["PSNR"]), reverse=True)
+        best_name, best_report = removed_attacks[0]
     else:
-        weakest   = sorted(reports.items(),
-                           key=lambda x: (x[1]["Payload Match (%)"],
-                                          -x[1]["SSIM"], -x[1]["PSNR"]))
-        best_name   = weakest[0][0]
-        best_report = weakest[0][1]
+        weakest = sorted(reports.items(),
+                         key=lambda x: (x[1]["Payload Match (%)"],
+                                        -x[1]["SSIM"], -x[1]["PSNR"]))
+        best_name, best_report = weakest[0]
 
-    best_image = attacks[best_name]
-    print(f"Best attack: {best_name}")
-
-    # Build result
-    wm_pil  = opencv_to_pil(watermarked)
-    out_pil = opencv_to_pil(best_image)
-
+    best_image   = attacks[best_name]
     removed_flag = not best_report["Detected"]
     ssim_val     = best_report["SSIM"]
     psnr_val     = best_report["PSNR"]
     payload_m    = best_report["Payload Match (%)"]
 
+    # Update analytics
+    analytics_data = update_analytics(removed_flag, ssim_val, psnr_val, best_name)
+
+    # Build result markdown
     both    = removed_flag and ssim_val >= 0.85
     nl      = removed_flag and ssim_val >= 0.97
     status  = ("✅ BOTH CRITERIA MET"     if both         else
                "✅ Removed (low quality)" if removed_flag else
                "❌ Watermark Not Removed")
-    quality = ("Near-lossless ✅" if nl          else
+    quality = ("Near-lossless ✅" if nl              else
                "OK ✅"            if ssim_val >= 0.85 else
                "Degraded ⚠️")
 
-    md = f"""## {status}
+    result_md = f"""## {status}
 
 | Metric | Value |
 |---|---|
@@ -318,10 +383,10 @@ def run(image):
 
 *Proxy: TrustMark-Q as surrogate for SynthID (Gowal et al., 2025)*
 """
-    return wm_pil, out_pil, md
+    return opencv_to_pil(watermarked), opencv_to_pil(best_image), result_md, get_analytics_md()
 
 # =============================================================================
-# GRADIO UI — Dark theme
+# GRADIO UI
 # =============================================================================
 css = """
     body, .gradio-container {
@@ -337,48 +402,42 @@ css = """
         margin-bottom: 16px;
     }
     .header h1 { color: #e8a0b0 !important; margin: 0 0 8px 0; font-size: 1.8rem; }
-    .header p  { color: #aaa !important; margin: 0; font-size: 0.9rem; }
+    .header p  { color: #aaa !important; margin: 0; font-size: 0.9rem; line-height: 1.6; }
     .card {
         background: #1a1a1a !important;
-        border: 1px solid #333 !important;
+        border: 1px solid #2a2a2a !important;
         border-radius: 14px !important;
         padding: 20px !important;
     }
     .run-btn {
         background: linear-gradient(135deg, #c9748a, #b05070) !important;
-        border: none !important;
-        border-radius: 10px !important;
-        color: white !important;
-        font-weight: 700 !important;
+        border: none !important; border-radius: 10px !important;
+        color: white !important; font-weight: 700 !important;
         font-size: 1rem !important;
-        box-shadow: 0 4px 15px rgba(201,116,138,0.4) !important;
+        box-shadow: 0 4px 15px rgba(201,116,138,0.35) !important;
     }
     .stats {
-        background: #1a1a1a;
-        border: 1px solid #333;
-        border-radius: 12px;
-        padding: 16px 24px;
-        display: flex;
-        gap: 32px;
-        flex-wrap: wrap;
-        margin-top: 12px;
-        align-items: center;
+        background: #1a1a1a; border: 1px solid #2a2a2a;
+        border-radius: 12px; padding: 16px 24px;
+        display: flex; gap: 32px; flex-wrap: wrap;
+        margin-top: 12px; align-items: center;
     }
     .sv { font-size: 1.5rem; font-weight: 700; color: #c9748a; }
-    .sl { font-size: 0.72rem; color: #666; margin-top: 2px; }
+    .sl { font-size: 0.72rem; color: #555; margin-top: 2px; }
     label, .label-wrap span { color: #ccc !important; }
-    .prose p, .prose h1, .prose h2, .prose h3 { color: #f0f0f0 !important; }
-    table { color: #f0f0f0 !important; }
-    th { background: #2a2a2a !important; color: #e8a0b0 !important; }
-    td { border-color: #333 !important; }
+    .prose p, .prose h1, .prose h2, .prose h3,
+    .prose td, .prose th { color: #f0f0f0 !important; }
+    table { color: #f0f0f0 !important; width: 100%; }
+    th { background: #2a2a2a !important; color: #e8a0b0 !important;
+         padding: 8px 12px !important; }
+    td { border-color: #2a2a2a !important; padding: 8px 12px !important; }
     footer { display: none !important; }
 """
 
 with gr.Blocks(
     title="SynthID Watermark Removal",
     theme=gr.themes.Base(
-        primary_hue="rose",
-        neutral_hue="slate",
+        primary_hue="rose", neutral_hue="slate",
         font=gr.themes.GoogleFont("Inter"),
     ),
     css=css
@@ -389,31 +448,33 @@ with gr.Blocks(
         <h1>🔬 SynthID Watermark Removal</h1>
         <p>
             Adaptive Watermark Weakening Pipeline &nbsp;·&nbsp;
-            PES University, Bengaluru (RR Campus) &nbsp;·&nbsp;
-            No custom neural network &nbsp;·&nbsp; Classical signal processing only
+            No custom neural network &nbsp;·&nbsp;
+            Classical signal processing &nbsp;·&nbsp;
+            Proxy: TrustMark-Q (surrogate for SynthID)
         </p>
     </div>
     """)
 
     with gr.Row():
+        # ── Input ─────────────────────────────────────────────────────────────
         with gr.Column(scale=1, min_width=280):
             with gr.Group(elem_classes="card"):
-                img_in  = gr.Image(label="Upload Image", type="pil")
+                img_in = gr.Image(label="Upload Image", type="pil")
                 with gr.Accordion("How it works", open=False):
                     gr.Markdown("""
-**Pipeline:**
-1. Embed TrustMark watermark
+**8-step pipeline:**
+1. Embed TrustMark watermark (proxy for SynthID)
 2. Compute importance map (texture + gradient + variance)
-3. Apply adaptive noise (Gaussian / Speckle / Salt & Pepper)
+3. Apply adaptive Gaussian / Speckle / Salt & Pepper noise
 4. DWT frequency perturbation on Y channel
-5. Geometric attacks (crop, scale, rotation) + JPEG combos
-6. Evaluate ~150 attack variants
-7. Return best result by SSIM + detection status
+5. Geometric attacks: Crop, Scale, Rotation
+6. JPEG compression variants (single + double)
+7. Evaluate ~150 attack variants on TrustMark decoder
+8. Return best result ranked by SSIM + detection status
                     """)
-                run_btn = gr.Button(
-                    "▶  Run Pipeline", elem_classes="run-btn", size="lg"
-                )
+                run_btn = gr.Button("▶  Run Pipeline", elem_classes="run-btn", size="lg")
 
+        # ── Output ────────────────────────────────────────────────────────────
         with gr.Column(scale=2):
             with gr.Group(elem_classes="card"):
                 with gr.Row():
@@ -421,13 +482,19 @@ with gr.Blocks(
                     out_img = gr.Image(label="🔓 Best Attack Output")
                 result_md = gr.Markdown("*Upload an image and click Run.*")
 
+    # ── Analytics ─────────────────────────────────────────────────────────────
+    with gr.Row():
+        with gr.Column():
+            analytics_md = gr.Markdown(get_analytics_md(), elem_classes="card")
+            refresh_btn  = gr.Button("🔄 Refresh Analytics", size="sm")
+
     gr.HTML("""
     <div class="stats">
-        <div><div class="sv">95.4%</div><div class="sl">Removal Rate</div></div>
+        <div><div class="sv">95.4%</div><div class="sl">Removal Rate<br><small>(500 embed test)</small></div></div>
         <div><div class="sv">15.0%</div><div class="sl">Quality-Preserving<br><small>(SSIM ≥ 0.85)</small></div></div>
         <div><div class="sv">100%</div><div class="sl">Precision</div></div>
         <div><div class="sv">~150</div><div class="sl">Attack Variants</div></div>
-        <div style="margin-left:auto;font-size:0.75rem;color:#555;line-height:1.8">
+        <div style="margin-left:auto;font-size:0.75rem;color:#444;line-height:1.8">
             Proxy: TrustMark-Q (Adobe Research)<br>
             Target: SynthID (Google DeepMind)<br>
             Gowal et al., arXiv:2510.09263, 2025
@@ -435,7 +502,13 @@ with gr.Blocks(
     </div>
     """)
 
-    run_btn.click(fn=run, inputs=[img_in], outputs=[wm_out, out_img, result_md])
+    run_btn.click(
+        fn=run,
+        inputs=[img_in],
+        outputs=[wm_out, out_img, result_md, analytics_md]
+    )
+    refresh_btn.click(fn=get_analytics_md, inputs=[], outputs=[analytics_md])
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
+    port = int(os.environ.get("PORT", 7860))
+    demo.launch(server_name="0.0.0.0", server_port=port)
