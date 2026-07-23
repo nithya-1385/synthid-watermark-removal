@@ -451,7 +451,6 @@ with gr.Blocks(
         <h1>🔬 SynthID Watermark Removal</h1>
         <p>
             Adaptive Watermark Weakening Pipeline &nbsp;·&nbsp;
-            PES University, Bengaluru (RR Campus)<br>
             No custom neural network &nbsp;·&nbsp;
             Classical signal processing &nbsp;·&nbsp;
             Proxy: TrustMark-Q (surrogate for SynthID)
