@@ -1,4 +1,3 @@
-sympy==1.12
 trustmark
 opencv-python-headless
 scikit-image
