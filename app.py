@@ -118,9 +118,7 @@ def normalize_map(data):
 # =============================================================================
 # TRUSTMARK
 # =============================================================================
-print("Loading TrustMark-Q...")
-TM = TrustMark(verbose=False, model_type="Q", use_ECC=True)
-print("Ready.")
+TM = None  # loaded on first request
 
 def embed_watermark(image):
     wm = TM.encode(opencv_to_pil(image), PAYLOAD, MODE="text", WM_STRENGTH=WM_STRENGTH)
@@ -303,6 +301,11 @@ def evaluate_attack(reference_image, attacked_image):
 # MAIN RUN
 # =============================================================================
 def run(image):
+    global TM
+    if TM is None:
+        print("Loading TrustMark-Q...")
+        TM = TrustMark(verbose=False, model_type="Q", use_ECC=True)
+        print("Ready.")
     if image is None:
         return None, None, "⚠️ Please upload an image.", get_analytics_md()
 
@@ -448,6 +451,7 @@ with gr.Blocks(
         <h1>🔬 SynthID Watermark Removal</h1>
         <p>
             Adaptive Watermark Weakening Pipeline &nbsp;·&nbsp;
+            PES University, Bengaluru (RR Campus)<br>
             No custom neural network &nbsp;·&nbsp;
             Classical signal processing &nbsp;·&nbsp;
             Proxy: TrustMark-Q (surrogate for SynthID)
