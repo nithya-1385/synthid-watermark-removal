@@ -540,4 +540,10 @@ This also reduces memory usage from ~750MB to ~250MB.
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    print(f"Starting Gradio on port {port}...")
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        show_error=True,
+        quiet=False
+    )
